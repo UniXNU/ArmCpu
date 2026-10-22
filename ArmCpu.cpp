@@ -86,10 +86,21 @@ public:
 
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
-// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// The EL1 virtual timer's PPI: INTID 27 by default (the SBSA assignment). boot-arg armcpu-timer-intid=<16..31> for SoCs that wire it
+// elsewhere: the TB128FU's SM6225 DT timer node lists PPIs 1, 2, 3, 0, so its virtual timer is INTID 19, and INTID 27 there is another
+// source that stays asserted (about 300000 interrupts a second per core, each taken as a timer tick).
+static uint32_t gTimerIntid = 27;
+// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and the timer PPI.
+static uint32_t sgiPpiEnable (void) { return 0xffffU | (1U << gTimerIntid); }
 
-static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+// INTIDs base..base+7 stand for 'IPI to logical core 0..7': 1008 by default (sheng); boot-arg armcpu-spi-ipi-base=<INTID> for a
+// distributor without those INTIDs (the TB128FU's GIC has 544, and its DT leaves SPIs 430..511 unused).
+static uint32_t gIpiSpiBase = 1008;
+extern "C" {
+// Per logical core, read back after spiIpiConfigure: bit 0 IGROUPR (Group 1), bit 1 ISENABLER, bits 8..15 IPRIORITYR,
+// bits 16..31 the low half of IROUTER; 0xffffffff not configured.
+volatile uint32_t armcpu_spi_ipi_check[8] = {~0U, ~0U, ~0U, ~0U, ~0U, ~0U, ~0U, ~0U};
+}
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
@@ -104,7 +115,7 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
 // Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
 static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
 {
-  const uint32_t id = kIpiSpiBase + core;
+  const uint32_t id = gIpiSpiBase + core;
   write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
   write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
   write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
@@ -112,11 +123,16 @@ static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (dist, 0x100 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
+  const uint32_t group = (read32 (dist, 0x80 + (id / 32) * 4) >> (id % 32)) & 1;
+  const uint32_t enabled = (read32 (dist, 0x100 + (id / 32) * 4) >> (id % 32)) & 1;
+  const uint32_t priority = (read32 (dist, 0x400 + (id / 4) * 4) >> ((id % 4) * 8)) & 0xff;
+  const uint32_t route = static_cast<uint32_t> (*reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id)) & 0xffff;
+  armcpu_spi_ipi_check[core & 7] = group | (enabled << 1) | (priority << 8) | (route << 16);
 }
 
 static void spiIpiSend (uintptr_t dist, uint32_t core)
 {
-  const uint32_t id = kIpiSpiBase + core;
+  const uint32_t id = gIpiSpiBase + core;
   __asm__ volatile ("dsb ishst" ::: "memory");
   write32 (dist, 0x200 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -170,6 +186,17 @@ static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
+// Interrupt accounting for boards whose IRQ rate is unexplained: IRQ exceptions in which the very first acknowledge already
+// returned a special INTID (>= 1020, nothing taken), per logical core, with ICC_HPPIR1_EL1 / ICC_RPR_EL1 / the raw IAR value of the
+// latest one; and the SPIs that reached an attached handler, with the latest INTID.
+volatile uint64_t armcpu_spurious = 0, armcpu_spi_handled = 0;
+volatile uint32_t armcpu_spurious_core[8], armcpu_spurious_hppir = 0, armcpu_spurious_rpr = 0, armcpu_spurious_iar = 0;
+volatile uint32_t armcpu_spi_handled_id = 0;
+// Per logical core, after rtclock_intr returned: how far ahead the virtual timer now is (CNTV_CVAL - CNTVCT, ticks) the last time,
+// and how often that was under 1000 ticks (about 52 us at 19.2 MHz): a deadline already in the past makes XNU program its
+// 10-tick minimum.
+volatile int32_t armcpu_timer_ahead[8];
+volatile uint32_t armcpu_timer_short[8];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -304,7 +331,7 @@ bool ArmCpu::wakeRedistributor (bool local)
   for (unsigned offset = 0x400; offset < 0x420; offset += 4) {
     write32 (sgi, offset, 0x80808080);
   }
-  if (!local) { write32 (sgi, 0x100, kSgiPpiEnable); }
+  if (!local) { write32 (sgi, 0x100, sgiPpiEnable ()); }
   __asm__ volatile ("dsb sy" ::: "memory");
   return waitClear (redist, 0, 8);
 }
@@ -333,7 +360,7 @@ void ArmCpu::enableGic (void)
   __asm__ volatile ("msr icc_bpr1_el1, %0" :: "r" (value) : "memory");
   if (!secondary) { gBootAffinity = affinity & 0xff00ffffffULL; }
   if (!secondary || !gRemoteGic) {
-    write32 (redist + 0x10000, 0x100, kSgiPpiEnable);
+    write32 (redist + 0x10000, 0x100, sgiPpiEnable ());
     write32 (dist, 0, read32 (dist, 0) | 0x12U);
   }
   value = 1;
@@ -370,6 +397,12 @@ bool ArmCpu::start (IOService *provider)
   unsigned diagnostic = 0;
   PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
   diagnosePower=diagnostic==1;
+  unsigned timerIntid = 27;
+  PE_parse_boot_argn ("armcpu-timer-intid", &timerIntid, sizeof (timerIntid));
+  if (timerIntid >= 16 && timerIntid < 32) { gTimerIntid = timerIntid; }
+  unsigned ipiBase = 1008;
+  PE_parse_boot_argn ("armcpu-spi-ipi-base", &ipiBase, sizeof (ipiBase));
+  if (ipiBase >= 32 && ipiBase + 8 <= 1020) { gIpiSpiBase = ipiBase; }
   uint32_t physical;
   OSData *reg = OSDynamicCast (OSData, provider->getProperty ("reg"));
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
@@ -563,21 +596,42 @@ void ArmCpu::interrupt (void)
     uint64_t id;
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
-    if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
-    if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
-    if ((id & 0xffffff) == 27) {
+    if ((id & 0xffffff) >= 1020) {
+      if (drained == 0) {
+        uint64_t hppir, rpr;
+        __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (hppir));
+        __asm__ volatile ("mrs %0, icc_rpr_el1" : "=r" (rpr));
+        armcpu_spurious = armcpu_spurious + 1;
+        armcpu_spurious_core[logicalId & 7] = armcpu_spurious_core[logicalId & 7] + 1;
+        armcpu_spurious_hppir = static_cast<uint32_t> (hppir);
+        armcpu_spurious_rpr = static_cast<uint32_t> (rpr);
+        armcpu_spurious_iar = static_cast<uint32_t> (id);
+      }
+      armcpu_irq_phase=0;break;
+    }
+    ++drained;
+    if(diagnosePower && drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+    if ((id & 0xffffff) == gTimerIntid) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
+      {
+        uint64_t cval, vct;
+        __asm__ volatile ("mrs %0, cntv_cval_el0" : "=r" (cval));
+        __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (vct));
+        const int64_t ahead = static_cast<int64_t> (cval - vct);
+        armcpu_timer_ahead[logicalId & 7] = static_cast<int32_t> (ahead > 0x7fffffff ? 0x7fffffff : ahead < -0x7fffffff ? -0x7fffffff : ahead);
+        if (ahead < 1000) { armcpu_timer_short[logicalId & 7] = armcpu_timer_short[logicalId & 7] + 1; }
+      }
     } else if ((id & 0xffffff) == 0) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       armcpu_irq_phase=4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
-    } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
+    } else if (gSpiIpi && (id & 0xffffff) >= gIpiSpiBase && (id & 0xffffff) < gIpiSpiBase + 8) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       armcpu_irq_phase = 4;
@@ -593,6 +647,8 @@ void ArmCpu::interrupt (void)
       if (spi != nullptr) {
         armcpu_irq_phase = 7;
         spi->count = spi->count + 1;
+        armcpu_spi_handled = armcpu_spi_handled + 1;
+        armcpu_spi_handled_id = intid;
         spi->handler (spi->context);
       } else if (intid >= 32 && gDist != 0) {
         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
