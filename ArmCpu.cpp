@@ -535,7 +535,11 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   processor_start (self->machProcessor);
   // Once every secondary core has started, the scheduler sets up its cluster edges (Edge migration and steal rules).
   static uint32_t started = 0;
-  if (__atomic_add_fetch (&started, 1U, __ATOMIC_ACQ_REL) + 1 == ml_get_topology_info ()->num_cpus) { ml_cpu_init_completed (); }
+  // armcpu-edge=0 leaves the Edge matrix all-disallowed (no thread moves between clusters). On iPadOS 27 the matrix fails the scheduler's
+  // own consistency check, which the kernel now reports instead of asserting.
+  unsigned edge = 0;
+  PE_parse_boot_argn ("armcpu-edge", &edge, sizeof (edge));
+  if (__atomic_add_fetch (&started, 1U, __ATOMIC_ACQ_REL) + 1 == ml_get_topology_info ()->num_cpus && edge != 0) { ml_cpu_init_completed (); }
   thread_terminate (current_thread ());
 }
 
@@ -628,10 +632,6 @@ void ArmCpu::interrupt (void)
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
-      // The pending bit goes before the handler runs: a signal sent while it runs sets the bit again and raises the next interrupt, and
-      // one sent before is already in the signal mask the handler is about to read. A software-pended SPI that stays pending would
-      // storm the core.
-      write32 (gDist, 0x280 + ((id & 0xffffff) / 32) * 4, 1U << ((id & 0xffffff) % 32));
       armcpu_irq_phase = 4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase = 5;
