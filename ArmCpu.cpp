@@ -33,6 +33,11 @@ volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical cor
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
+// IRQ drains (ArmCpu::interrupt takes interrupts until none is pending) that took more than 128, and the most one took. A burst
+// of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
+// when it signals end of interrupt, and the virtual timer fires again.
+volatile uint64_t armcpu_irq_long_drains = 0;
+volatile uint32_t armcpu_irq_drain_most = 0;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
 // Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
 // 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 running.
@@ -59,6 +64,7 @@ class ArmCpu : public IOCPU {
   bool skipGic = false;
   bool diagnosePower = false;
   bool secondary = false;
+  bool bootInitialized = false;
   uint32_t logicalId = 0;
   bool mapGic (void);
   bool initDistributor (void);
@@ -122,6 +128,16 @@ static void spiIpiSend (uintptr_t dist, uint32_t core)
   __asm__ volatile ("dsb sy" ::: "memory");
 }
 
+// The cluster type the ADT gives this core (cluster-type 'E' or 'P'), so each cluster registers as its own processor set.
+static cluster_type_t clusterType (uint32_t physical)
+{
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  for (unsigned i = 0; i < topology->num_cpus; i++) {
+    if (topology->cpus[i].phys_id == physical) { return topology->cpus[i].cluster_type; }
+  }
+  return ml_get_boot_cluster_type ();
+}
+
 static uint64_t counter (void)
 {
   uint64_t value;
@@ -129,17 +145,35 @@ static uint64_t counter (void)
   return value;
 }
 
+// Polls until the bits clear. The limit counts polls as well as time: the counter runs on while the host has this vCPU's thread
+// descheduled, so a time limit alone (it was 100 ms) can fail a wake that had no chance to complete.
 static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
 {
   uint64_t frequency;
   __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frequency));
   uint64_t started = counter ();
-  while ((read32 (base, offset) & mask) != 0) {
-    if (counter () - started > frequency / 10) {
+  for (unsigned polls = 0; (read32 (base, offset) & mask) != 0; ++polls) {
+    if (polls > 100000 && counter () - started > frequency) {
       return false;
     }
   }
   return true;
+}
+
+// Parks a core that cannot join for good, in WFI with its virtual timer and Group 1 interrupts off, so that it waits blocked:
+// Gunyah traps WFI and blocks the vCPU but runs WFE in the guest, and a vCPU left in WFE kept its physical core until the host's
+// watchdog rebooted the phone.
+static void __attribute__ ((noreturn)) parkCore (void)
+{
+  __asm__ volatile ("msr daifset, #0xf\n msr cntv_ctl_el0, xzr\n isb" ::: "memory");
+  uint64_t pfr0;
+  __asm__ volatile ("mrs %0, id_aa64pfr0_el1" : "=r" (pfr0));
+  if (((pfr0 >> 24) & 0xf) != 0) {
+    uint64_t sre;
+    __asm__ volatile ("mrs %0, S3_0_C12_C12_5" : "=r" (sre));           // ICC_SRE_EL1
+    if ((sre & 1) != 0) { __asm__ volatile ("msr S3_0_C12_C12_7, xzr\n isb" ::: "memory"); }   // ICC_IGRPEN1_EL1
+  }
+  for (;;) { __asm__ volatile ("dsb sy\n wfi" ::: "memory"); }
 }
 
 // GIC state shared by all CPU nubs. The boot CPU maps the distributor and redistributor frames; a secondary core
@@ -399,12 +433,8 @@ bool ArmCpu::start (IOService *provider)
   info.phys_id = physical;
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
-  info.cluster_type = ml_get_boot_cluster_type ();
-  perfmon_interrupt_handler_func pmi = nullptr;
-  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
-  if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  info.cluster_type = clusterType (physical);
   setCPUNumber (info.log_id);
-  armcpu_registered = 1;
   unsigned smp = 0;
   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
@@ -423,7 +453,13 @@ bool ArmCpu::start (IOService *provider)
     panic ("ArmCpu: CPU IRQ action registration failed");
   }
   gController = controller;
-  initCPU (true);
+  // Newer kernels boot the processor from ml_processor_register, which calls initCPU and enables the GIC and
+  // timer; the handler above must already be installed. Older kernels leave initCPU to the driver.
+  perfmon_interrupt_handler_func pmi = nullptr;
+  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+  if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  armcpu_registered = 1;
+  if (!bootInitialized) { initCPU (true); }
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
   drainPending ();
@@ -449,7 +485,7 @@ bool ArmCpu::finishSecondary (void)
   info.phys_id = static_cast<uint32_t> (affinity);
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
@@ -497,6 +533,9 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   armcpu_smp_step[self->logicalId] = 3;
   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
   processor_start (self->machProcessor);
+  // Once every secondary core has started, the scheduler sets up its cluster edges (Edge migration and steal rules).
+  static uint32_t started = 0;
+  if (__atomic_add_fetch (&started, 1U, __ATOMIC_ACQ_REL) + 1 == ml_get_topology_info ()->num_cpus) { ml_cpu_init_completed (); }
   thread_terminate (current_thread ());
 }
 
@@ -519,8 +558,8 @@ void ArmCpu::initCPU (bool boot)
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
     armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
     // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
-    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
-    if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
+    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; parkCore (); }
+    if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; parkCore (); }
     armcpu_smp_step[logicalId] = 6;
     enableGic ();
     if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
@@ -541,12 +580,14 @@ void ArmCpu::initCPU (bool boot)
     // Explicit A/B hardware diagnostic: do not touch GIC MMIO or enable an
     // interrupt source. CPU registration still happens; the timer is left off.
     setCPUState (kIOCPUStateRunning);
+    bootInitialized = true;
     return;
   }
   enableGic ();
   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
   enableCPUTimeBase (true);
   setCPUState (kIOCPUStateRunning);
+  bootInitialized = true;
   if (gSelfIpi) { signalCPU (this); }
 }
 
@@ -563,8 +604,15 @@ void ArmCpu::interrupt (void)
     uint64_t id;
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
-    if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
-    if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+    if ((id & 0xffffff) >= 1020) {
+      armcpu_irq_phase=0;
+      if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
+      if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
+      break;
+    }
+    // Only an interrupt that never stops coming (a level line nobody clears) is a fault: a million in one drain.
+    ++drained;
+    if(diagnosePower && drained>1000000)panic("ArmCpu: IRQ drain exceeds 1000000 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if ((id & 0xffffff) == 27) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
@@ -580,6 +628,10 @@ void ArmCpu::interrupt (void)
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
+      // The pending bit goes before the handler runs: a signal sent while it runs sets the bit again and raises the next interrupt, and
+      // one sent before is already in the signal mask the handler is about to read. A software-pended SPI that stays pending would
+      // storm the core.
+      write32 (gDist, 0x280 + ((id & 0xffffff) / 32) * 4, 1U << ((id & 0xffffff) % 32));
       armcpu_irq_phase = 4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase = 5;
