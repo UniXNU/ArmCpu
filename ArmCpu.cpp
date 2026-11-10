@@ -74,8 +74,9 @@ struct ArmCpuCoreStats {
   uint32_t sent;               // IPIs this core sent
   uint32_t sentDeferred;       // those of them the scheduler asked to defer
   uint32_t cancelled;          // deferred IPIs the scheduler asked this core to take back
-  uint32_t sendMost;           // counter ticks of the slowest send
-  uint64_t sendTicks;          // counter ticks of all sends
+  uint32_t sendMost;           // counter ticks of the slowest timed send
+  uint32_t sendsTimed;         // sends to another core while the times are kept
+  uint64_t sendTicks;          // counter ticks of all timed sends
   uint64_t sentAt;             // counter at the oldest IPI sent to this core that it has not handled; 0 none. Atomic.
   uint32_t taken[2][4];        // IPIs handled under 50 us, under 200 us, under 1 ms, later after the send: [0] awake, [1] out of idle
   uint32_t takenMost[2];       // counter ticks of the slowest
@@ -793,11 +794,15 @@ void ArmCpu::signalCPU (IOCPU *target)
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
   armcpu_ipi_sent = armcpu_ipi_sent + 1;
-  // The kernel calls this on the sending core with interrupts masked, so that core's statistics need no lock.
+  // The kernel's cpu_signal path calls this on the sending core with interrupts masked, so that core's statistics need no lock and
+  // nothing runs between the two counter reads. The start-up IPI a core sends itself from initCPU is counted but neither stamped
+  // nor timed: the core takes it only when it first unmasks interrupts, which is not a cross-core delay, and on the boot core
+  // initCPU runs in thread context, where the handler could run inside the timed send.
   ArmCpuCoreStats &core = gCore[logicalId & 7];
   core.sent = core.sent + 1;
+  const bool timed = gStats && peer != this;
   uint64_t before = 0;
-  if (gStats) {
+  if (timed) {
     before = counter ();
     uint64_t none = 0;
     __atomic_compare_exchange_n (&gCore[peer->logicalId & 7].sentAt, &none, before, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
@@ -807,8 +812,9 @@ void ArmCpu::signalCPU (IOCPU *target)
   } else {
     __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
   }
-  if (gStats) {
+  if (timed) {
     const uint64_t ticks = counter () - before;
+    core.sendsTimed = core.sendsTimed + 1;
     core.sendTicks = core.sendTicks + ticks;
     if (ticks > core.sendMost) { core.sendMost = ticks > 0xffffffffULL ? 0xffffffffU : static_cast<uint32_t> (ticks); }
   }
@@ -1128,7 +1134,7 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
   if (cpu == ARMCPU_SMP_SLOTS) { return 0; }
   const ArmCpuCoreStats &core = gCore[cpu];
   const uint64_t hz = gCounterHz;
-  const uint32_t sent = core.sent;
+  const uint32_t sent = core.sent, timed = core.sendsTimed;
   snprintf (row, size, "[cpu%u] idle n=%u/%u/%u/%u ms=%llu/%llu/%llu/%llu woke t=%u i=%u d=%u n=%u | irq t=%u i=%u d=%u | ipi out=%u def=%u can=%u "
             "ns=%llu/%llu | in awake %u/%u/%u/%u us=%llu | in idle %u/%u/%u/%u us=%llu",
             cpu, core.idlePeriods[0], core.idlePeriods[1], core.idlePeriods[2], core.idlePeriods[3],
@@ -1136,7 +1142,7 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
             static_cast<unsigned long long> (core.idleTicks[2] * 1000 / hz), static_cast<unsigned long long> (core.idleTicks[3] * 1000 / hz),
             core.wokenBy[0], core.wokenBy[1], core.wokenBy[2], core.wokenBy[3],
             armcpu_core_timer[cpu], armcpu_core_sgi[cpu], core.deviceInterrupts, sent, core.sentDeferred, core.cancelled,
-            static_cast<unsigned long long> (sent != 0 ? core.sendTicks * 1000ULL / sent * 1000000ULL / hz : 0),
+            static_cast<unsigned long long> (timed != 0 ? core.sendTicks * 1000ULL / timed * 1000000ULL / hz : 0),
             static_cast<unsigned long long> (core.sendMost * 1000000000ULL / hz),
             core.taken[0][0], core.taken[0][1], core.taken[0][2], core.taken[0][3],
             static_cast<unsigned long long> (core.takenMost[0] * 1000000ULL / hz),

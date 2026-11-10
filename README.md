@@ -26,6 +26,8 @@ its idle periods by length (under 100 us, under 1 ms, under 8 ms, longer) and
 the time in each, what ended them (timer, IPI, device interrupt, no interrupt),
 the cost of a send, and the delay from a send to the target's handler (under
 50 us, under 200 us, under 1 ms, longer) for an awake and for an idle target.
+The start-up IPI a core sends itself (`armcpu-self-ipi=1`) is counted as sent
+and taken but is in neither the send cost nor the delays.
 
 The sheng `scripts/check-bluetooth-shared.py` fixture checks the production
 registration, dispatch, masking and concurrent registration paths. The source
