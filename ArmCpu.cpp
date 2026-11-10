@@ -1011,10 +1011,11 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   if (gStats && __atomic_exchange_n (&asked, 1U, __ATOMIC_ACQ_REL) == 0) {
     // What the firmware offers for idle. These calls change no state: PSCI_VERSION, then from PSCI 1.0 on PSCI_FEATURES of the SMC64
     // CPU_SUSPEND and of PSCI_SET_SUSPEND_MODE.
-    const int64_t version = psciCall (hvc, 0x84000000ULL, 0, 0, 0);
-    armcpu_psci[1] = static_cast<int32_t> (version);
+    // PSCI_VERSION is a 32-bit call: its answer is the low half of x0, and a negative one is an error.
+    const int32_t version = static_cast<int32_t> (psciCall (hvc, 0x84000000ULL, 0, 0, 0));
+    armcpu_psci[1] = version;
     armcpu_psci[0] = 1;
-    if (version >= 0x10000 && version <= 0x7fffffff) {
+    if (version >= 0x10000) {
       armcpu_psci[2] = static_cast<int32_t> (psciCall (hvc, 0x8400000aULL, 0xc4000001ULL, 0, 0));
       armcpu_psci[3] = static_cast<int32_t> (psciCall (hvc, 0x8400000aULL, 0x8400000fULL, 0, 0));
       armcpu_psci[0] = 2;
@@ -1139,10 +1140,14 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
   if (row == nullptr || size == 0) { return 0; }
   const uint32_t seen = __atomic_load_n (&gCoreSeen, __ATOMIC_ACQUIRE);
   if (index == 0) {
-    uint64_t deferred = 0, cancelled = 0;
-    for (unsigned c = 0; c < ARMCPU_SMP_SLOTS; c++) { deferred += gCore[c].sentDeferred; cancelled += gCore[c].cancelled; }
+    // Sums of the per-core counters, each written by its own core only. armcpu_ipi_sent and armcpu_ipi_interrupts are shared by
+    // all cores without a lock and lose counts.
+    uint64_t sent = 0, taken = 0, deferred = 0, cancelled = 0;
+    for (unsigned c = 0; c < ARMCPU_SMP_SLOTS; c++) {
+      sent += gCore[c].sent; taken += armcpu_core_sgi[c]; deferred += gCore[c].sentDeferred; cancelled += gCore[c].cancelled;
+    }
     snprintf (row, size, "[cpu wake] ipi sent=%llu taken=%llu deferred=%llu cancel=%llu | sched init completed=%u | idle latency us=%u | psci ",
-              static_cast<unsigned long long> (armcpu_ipi_sent), static_cast<unsigned long long> (armcpu_ipi_interrupts),
+              static_cast<unsigned long long> (sent), static_cast<unsigned long long> (taken),
               static_cast<unsigned long long> (deferred), static_cast<unsigned long long> (cancelled), armcpu_cpu_init_completed,
               gIdleLatencyNs / 1000U);
     const unsigned n = static_cast<unsigned> (strnlen (row, size));
