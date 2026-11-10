@@ -28,6 +28,16 @@ the cost of a send, and the delay from a send to the target's handler (under
 50 us, under 200 us, under 1 ms, longer) for an awake and for an idle target.
 The start-up IPI a core sends itself (`armcpu-self-ipi=1`) is counted as sent
 and taken but is in neither the send cost nor the delays.
+After the core rows comes one row per core with its timer interrupts by the
+delay after their deadline (same ranges), again awake and out of idle. The
+timer is one per core and one-shot; the delay out of idle is the time the
+core takes to leave idle.
+
+`armcpu-idle-latency-us=N` registers every core with that time as its power
+gate latency (default 0: none). The kernel then spins through a delay shorter
+than N instead of blocking the thread on a timer, sets an idle core's timer N
+ahead of the deadline, and keeps a core out of WFI for a deadline closer than
+N. Row 0 shows the value.
 
 The sheng `scripts/check-bluetooth-shared.py` fixture checks the production
 registration, dispatch, masking and concurrent registration paths. The source

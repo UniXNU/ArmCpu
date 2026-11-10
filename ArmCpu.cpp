@@ -80,11 +80,19 @@ struct ArmCpuCoreStats {
   uint64_t sentAt;             // counter at the oldest IPI sent to this core that it has not handled; 0 none. Atomic.
   uint32_t taken[2][4];        // IPIs handled under 50 us, under 200 us, under 1 ms, later after the send: [0] awake, [1] out of idle
   uint32_t takenMost[2];       // counter ticks of the slowest
+  uint32_t timerLate[2][4];    // timer interrupts taken under 50 us, under 200 us, under 1 ms, later after their deadline: [0] awake, [1] out of idle
+  uint32_t timerLateMost[2];   // counter ticks of the latest
 } __attribute__ ((aligned (128)));
 static ArmCpuCoreStats gCore[ARMCPU_SMP_SLOTS];
 static volatile uint32_t gCoreSeen = 0;   // logical cores that registered, one bit each
 static bool gStats = false;               // boot-arg diag=1
 static uint64_t gCounterHz = 0;           // CNTFRQ_EL0
+// Boot-arg armcpu-idle-latency-us: the time a core needs to leave idle, given to the kernel as the processor's power gate latency.
+// The kernel then spins through a delay shorter than this instead of blocking the thread on a timer (ml_delay_should_spin), sets an
+// idle core's timer this much ahead of the deadline and waits out the rest awake (SetIdlePop, rtclock_intr), and does not enter WFI
+// for a deadline closer than this. 0, the default, registers no latency: every delay of a thread blocks and a timer is taken as late
+// as the core takes to leave idle. The rows of armcpu_stats_row measure that time (timer late, in idle).
+static uint32_t gIdleLatencyNs = 0;
 
 class ArmCpu : public IOCPU {
   OSDeclareDefaultStructors (ArmCpu)
@@ -206,6 +214,21 @@ static inline void ipiTaken (ArmCpuCoreStats &core, bool fromIdle)
   const unsigned which = fromIdle ? 1 : 0, slot = range (ticks, gCounterHz / 20000, gCounterHz / 5000, gCounterHz / 1000);
   core.taken[which][slot] = core.taken[which][slot] + 1;
   if (ticks > core.takenMost[which]) { core.takenMost[which] = ticks > 0xffffffffULL ? 0xffffffffU : static_cast<uint32_t> (ticks); }
+}
+
+// How long after its deadline this core takes the timer interrupt, awake or out of idle. CNTV_TVAL_EL0 is the deadline minus the
+// counter as a signed 32-bit value and goes on counting down after the timer fired, so here it is the delay, negated. The timer is
+// one per core and one-shot: the kernel writes each next deadline (ml_set_decrementer).
+static inline void timerTaken (ArmCpuCoreStats &core, bool fromIdle)
+{
+  if (!gStats) { return; }
+  uint64_t value;
+  __asm__ volatile ("mrs %0, cntv_tval_el0" : "=r" (value));
+  const int64_t left = static_cast<int32_t> (static_cast<uint32_t> (value));
+  const uint64_t ticks = left < 0 ? static_cast<uint64_t> (-left) : 0;
+  const unsigned which = fromIdle ? 1 : 0, slot = range (ticks, gCounterHz / 20000, gCounterHz / 5000, gCounterHz / 1000);
+  core.timerLate[which][slot] = core.timerLate[which][slot] + 1;
+  if (ticks > core.timerLateMost[which]) { core.timerLateMost[which] = static_cast<uint32_t> (ticks); }
 }
 
 // Polls until the bits clear. The limit counts polls as well as time: the counter runs on while the host has this vCPU's thread
@@ -497,6 +520,9 @@ bool ArmCpu::start (IOService *provider)
   PE_parse_boot_argn ("diag", &stats, sizeof (stats));
   __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (gCounterHz));
   gStats = stats == 1 && gCounterHz != 0;
+  unsigned idleLatencyUs = 0;
+  PE_parse_boot_argn ("armcpu-idle-latency-us", &idleLatencyUs, sizeof (idleLatencyUs));
+  gIdleLatencyNs = idleLatencyUs > 4000000U ? 4000000000U : idleLatencyUs * 1000U;
   uint32_t physical;
   OSData *reg = OSDynamicCast (OSData, provider->getProperty ("reg"));
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
@@ -527,6 +553,7 @@ bool ArmCpu::start (IOService *provider)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
   info.cluster_type = clusterType (physical);
+  info.powergate_latency = gIdleLatencyNs;
   if (gStats) { info.processor_idle = &ArmCpu::idleNotify; }
   __atomic_fetch_or (&gCoreSeen, 1U << (logicalId & 7), __ATOMIC_RELEASE);
   setCPUNumber (info.log_id);
@@ -581,6 +608,7 @@ bool ArmCpu::finishSecondary (void)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
   info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
+  info.powergate_latency = gIdleLatencyNs;
   if (gStats) { info.processor_idle = &ArmCpu::idleNotify; }
   __atomic_fetch_or (&gCoreSeen, 1U << (logicalId & 7), __ATOMIC_RELEASE);
   perfmon_interrupt_handler_func pmi = nullptr;
@@ -745,6 +773,7 @@ void ArmCpu::interrupt (void)
     if ((id & 0xffffff) == 27) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
+      timerTaken (core, core.wakeOpen != 0);
       wokenBy (core, 0);
       armcpu_irq_phase=2;
       rtclock_intr (0);
@@ -1098,11 +1127,12 @@ extern "C" uint64_t armcpu_spi_count (uint32_t intid)
 }
 
 // One text row of the statistics for a board log. Row 0, always there: the IPI totals, whether the scheduler got
-// ml_cpu_init_completed, and the firmware's PSCI answers. With diag=1 one more row per registered core follows, each list in the
-// order of the ranges of ArmCpuCoreStats:
+// ml_cpu_init_completed, the idle latency the cores are registered with, and the firmware's PSCI answers. With diag=1 one more row
+// per registered core follows, each list in the order of the ranges of ArmCpuCoreStats:
 //   idle n= periods, ms= time in them | woken by timer, IPI, device interrupt, none
 //   ipi out= sent, def= asked deferred, can= cancel requests, ns= mean and longest send
 //   in awake / in idle: IPIs by the delay from the send to the handler, us= the longest
+// and after those one row per registered core with its timer interrupts by the delay after their deadline, us= the longest.
 // Returns the row's length, 0 past the last row.
 extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
 {
@@ -1111,9 +1141,10 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
   if (index == 0) {
     uint64_t deferred = 0, cancelled = 0;
     for (unsigned c = 0; c < ARMCPU_SMP_SLOTS; c++) { deferred += gCore[c].sentDeferred; cancelled += gCore[c].cancelled; }
-    snprintf (row, size, "[cpu wake] ipi sent=%llu taken=%llu deferred=%llu cancel=%llu | sched init completed=%u | psci ",
+    snprintf (row, size, "[cpu wake] ipi sent=%llu taken=%llu deferred=%llu cancel=%llu | sched init completed=%u | idle latency us=%u | psci ",
               static_cast<unsigned long long> (armcpu_ipi_sent), static_cast<unsigned long long> (armcpu_ipi_interrupts),
-              static_cast<unsigned long long> (deferred), static_cast<unsigned long long> (cancelled), armcpu_cpu_init_completed);
+              static_cast<unsigned long long> (deferred), static_cast<unsigned long long> (cancelled), armcpu_cpu_init_completed,
+              gIdleLatencyNs / 1000U);
     const unsigned n = static_cast<unsigned> (strnlen (row, size));
     if (n + 1 < size) {
       if (armcpu_psci[0] == 0) {
@@ -1127,6 +1158,9 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
     return static_cast<unsigned> (strnlen (row, size));
   }
   if (!gStats) { return 0; }
+  const unsigned cores = static_cast<unsigned> (__builtin_popcount (seen));
+  const bool timerRow = index > cores;
+  if (timerRow) { index -= cores; }
   unsigned cpu = ARMCPU_SMP_SLOTS;
   for (unsigned c = 0, at = 0; c < ARMCPU_SMP_SLOTS; c++) {
     if ((seen & (1U << c)) != 0 && ++at == index) { cpu = c; break; }
@@ -1134,6 +1168,14 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
   if (cpu == ARMCPU_SMP_SLOTS) { return 0; }
   const ArmCpuCoreStats &core = gCore[cpu];
   const uint64_t hz = gCounterHz;
+  if (timerRow) {
+    snprintf (row, size, "[cpu%u timer] late awake %u/%u/%u/%u us=%llu | late in idle %u/%u/%u/%u us=%llu", cpu,
+              core.timerLate[0][0], core.timerLate[0][1], core.timerLate[0][2], core.timerLate[0][3],
+              static_cast<unsigned long long> (core.timerLateMost[0] * 1000000ULL / hz),
+              core.timerLate[1][0], core.timerLate[1][1], core.timerLate[1][2], core.timerLate[1][3],
+              static_cast<unsigned long long> (core.timerLateMost[1] * 1000000ULL / hz));
+    return static_cast<unsigned> (strnlen (row, size));
+  }
   const uint32_t sent = core.sent, timed = core.sendsTimed;
   snprintf (row, size, "[cpu%u] idle n=%u/%u/%u/%u ms=%llu/%llu/%llu/%llu woke t=%u i=%u d=%u n=%u | irq t=%u i=%u d=%u | ipi out=%u def=%u can=%u "
             "ns=%llu/%llu | in awake %u/%u/%u/%u us=%llu | in idle %u/%u/%u/%u us=%llu",
