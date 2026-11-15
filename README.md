@@ -39,6 +39,8 @@ than N instead of blocking the thread on a timer, sets an idle core's timer N
 ahead of the deadline, and keeps a core out of WFI for a deadline closer than
 N. Row 0 shows the value.
 
+Counter sampling orders `ISB` before reading `CNTVCT_EL0`. GIC control, SGI and EOI sequences retain their synchronization barriers. Multi-instruction inline assembly uses newline separators.
+
 The sheng `scripts/check-bluetooth-shared.py` fixture checks the production
 registration, dispatch, masking and concurrent registration paths. The source
 also compiles with the selected iPadOS 27 arm64e kernel command.
