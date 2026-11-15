@@ -17,6 +17,10 @@ CPU_SUSPEND state is entered. `armcpu-edge=1` calls `ml_cpu_init_completed`
 after the last core started, which lets the Edge scheduler build its cluster
 matrix; `armcpu_cpu_init_completed` reports it.
 
+The per-core SGI/PPI enable mask contains SGI 0 and architectural timer PPI 27.
+The periodic interrupt self-probe sends the enabled SGI 0 and consumes its
+acknowledgement while normal interrupts are masked.
+
 `armcpu_stats_row(index, row, size)` formats wake and idle statistics for a
 board log. Row 0 is always present: IPIs sent and taken, deferred and cancel
 requests, the scheduler state and the firmware's PSCI answers. With `diag=1`
