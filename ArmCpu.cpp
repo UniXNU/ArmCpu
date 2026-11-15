@@ -139,8 +139,8 @@ public:
 
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
-// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// Redistributor ISENABLER0: the kernel's SGI 0 and virtual timer PPI 27.
+static const uint32_t kSgiPpiEnable = 1U | (1U << 27);
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
@@ -900,10 +900,9 @@ extern "C" void armcpu_gic_diag (uint64_t aff, uint32_t *out)
   armcpu_gic_diag_stage = 0xe;
 }
 
-// Does an SGI sent to the calling core itself become pending at its own CPU interface, and which INTIDs? Only system registers are used (no GIC
-// MMIO). With IRQs masked, SGIs 0..15 are sent one at a time to this core's own MPIDR affinity through ICC_SGI1R_EL1 (Group 1) and, when that
-// shows nothing, through ICC_SGI0R_EL1 (Group 0); ICC_HPPIR1_EL1 / ICC_HPPIR0_EL1 is polled and a pending SGI is acknowledged and ended here so the
-// kernel never sees it. out[8], out[9]: CNTVCT ticks of one ICC_SGI1R_EL1 write and of one ICC_PMR_EL1 read (a trapped write costs far more). out: 0 MPIDR, 1 INTIDs pending as Group 1, 2 INTIDs pending as Group 0, 3 ICC_PMR, 4 ICC_IGRPEN1, 5 ICC_SRE, 6 ICC_CTLR, 7 ICC_RPR.
+// Measure self-delivery of the owned SGIs with IRQs masked. A pending SGI is acknowledged and ended here; a delayed delivery is handled
+// by the kernel's registered IPI handler. out[8], out[9]: CNTVCT ticks for an ICC_SGI1R_EL1 write and ICC_PMR_EL1 read. out: 0 MPIDR,
+// 1 pending Group 1 mask, 2 pending Group 0 mask, 3 ICC_PMR, 4 ICC_IGRPEN1, 5 ICC_SRE, 6 ICC_CTLR, 7 ICC_RPR.
 extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
 {
   uint64_t mpidr, daif, v;
@@ -919,6 +918,7 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
   if ((mpidr & 0xff) < 16) {
     const uint64_t base = ((mpidr & 0xff00000000ULL) << 16) | ((mpidr & 0xff0000) << 16) | ((mpidr & 0xff00) << 8) | (1ULL << (mpidr & 0xff));
     for (uint64_t intid = 0; intid < 16; intid++) {
+      if (!(kSgiPpiEnable & (1U << intid))) { continue; }
       const uint64_t sgi = base | (intid << 24);
       uint64_t h = 1023, ta, tb;
       __asm__ volatile ("dsb ishst\n\tisb\n\tmrs %0, cntvct_el0\n\tisb" : "=r" (ta) :: "memory");
