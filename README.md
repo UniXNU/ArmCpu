@@ -49,4 +49,22 @@ The sheng `scripts/check-bluetooth-shared.py` fixture checks the production
 registration, dispatch, masking and concurrent registration paths. The source
 also compiles with the selected iPadOS 27 arm64e kernel command.
 
+## Platform sleep
+
+`platform-sleep=1` enables suspend when the board kernel supplies
+`arm64_platform_sleep_hook` and the firmware supplies the PSCI conduit. Boards
+register wake sources and prepare, restore and periodic tick callbacks through
+`armcpu_sleep_register` and the layouts in `ArmCpuSleep.h`.
+
+Secondary cores use PSCI CPU_OFF. The boot core waits with only the registered
+wake sources enabled, acknowledges rejected interrupts and masks a source that
+repeatedly fires. `platform-sleep-wake-after=N` uses an absolute virtual-timer
+deadline. Board ticks share that timer. Resume restores interrupt state and
+sends each returning core its self-IPI.
+
+GIC register accessors emit a single load or store without address writeback,
+including at `-Os` and `-O2`, for hypervisors that emulate register accesses.
+`tools/check-sleep-host.py` checks sleep decisions and deadlines;
+`tools/check-mmio-access.py` checks the compiled MMIO accessors.
+
 Build and interface details: [documentation](https://unixnu.com/reference/components). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
