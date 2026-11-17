@@ -62,7 +62,7 @@ volatile struct armcpu_sleep_stats armcpu_sleep_stats;
 volatile int32_t armcpu_sleep_last_cpu_off_rc = 0;
 }
 // The board XNU patch's hook in ml_arm_sleep (osfmk/arm64/cpu.c): called on each core on its way to sleep, the boot core last.
-extern "C" void (*arm64_platform_sleep_hook) (boolean_t boot_cpu);
+extern "C" void (*arm64_platform_sleep_hook) (boolean_t boot_cpu) __attribute__((weak_import));
 extern "C" void ml_arm_sleep (void) __attribute__ ((noreturn));
 extern "C" boolean_t ml_is_quiescing (void);
 
@@ -597,7 +597,7 @@ bool ArmCpu::start (IOService *provider)
     unsigned wakeAfter = 0;
     PE_parse_boot_argn ("platform-sleep-wake-after", &wakeAfter, sizeof (wakeAfter));
     gSleepWakeAfterS = wakeAfter;
-    if (sleep == 1 && !skipGic && psciConduit (&gSleepHvc)) {
+    if (sleep == 1 && &arm64_platform_sleep_hook && !skipGic && psciConduit (&gSleepHvc)) {
       gSleepEnabled = true;
       arm64_platform_sleep_hook = &armcpuPlatformSleep;
     }
